@@ -9,11 +9,11 @@ Każdy zasięg ma własną nazwę, liczbę heksów i kolor, a listę można dowo
 2. Przeciągnij token. Rusza się od razu za myszką (z przyciąganiem do siatki), a zasięgi zostają w miejscu startu.
    Linia pokazuje drogę, a etykieta liczbę heksów od punktu startu.
 3. Przeciągnięcie z pustego miejsca na mapie robi to samo bez przesuwania czegokolwiek (sam pomiar).
-4. Gdy tryb **Zasięgi hex** jest aktywny, na pasku pojawia się przycisk **Ustawienia zasięgów** (suwaki).
+4. Gdy aktywne jest narzędzie **Measure**, na pasku jest przycisk **Ustawienia zasięgów** (suwaki).
    Tam zmieniasz nazwy, liczby heksów, kolory, widoczność oraz dodajesz i usuwasz zasięgi.
 
 Każdy zasięg jest osobnym pierścieniem (komórki między poprzednim a tym zasięgiem), więc kolory się nie nakładają ani nie mieszają.
-Podgląd widzisz tylko Ty (elementy lokalne). Działa tylko na scenach z siatką **Hex**; ustawienia zapisują się w metadanych pokoju.
+Kolorowe zasięgi widzisz tylko Ty; linię pomiaru i liczbę heksów widzą też inni gracze, tak jak ruch tokenu. Działa tylko na scenach z siatką **Hex**; ustawienia zapisują się w metadanych pokoju.
 
 Przeciągane są tokeny z warstw Character, Mount i Prop, które nie są zablokowane. Przesuwany jest jeden token naraz.
 

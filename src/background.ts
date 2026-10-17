@@ -40,31 +40,27 @@ const MOVABLE_LAYERS: string[] = ["CHARACTER", "MOUNT", "PROP"];
 
 const FILL_OPACITY = 0.3;
 
-type ItemInteraction = [(recipe: (draft: Item) => void) => unknown, () => void];
+/** Wynik OBR.interaction.startItemInteraction dla listy elementów. */
+type InteractionUpdate = (recipe: (items: Item[]) => void) => Item[];
+type InteractionStop = () => void;
 
-interface TokenDrag {
-  id: string;
-  update: ItemInteraction[0];
-  stop: ItemInteraction[1];
+interface DragState {
+  update: InteractionUpdate;
+  stop: InteractionStop;
+  /** Id przeciąganego tokenu (null przy samym pomiarze z pustego miejsca). */
+  tokenId: string | null;
   /** Różnica: pozycja tokenu minus pozycja kursora w chwili chwycenia. */
   grab: Vector2;
   startPosition: Vector2;
   lastPosition: Vector2;
-}
-
-interface Visual {
   origin: Point;
   orientation: Orientation;
   dpi: number;
   rulerId: string;
   labelId: string;
-  ids: string[];
+  /** Lokalne (prywatne) elementy zasięgów, które trzeba usunąć na końcu. */
+  localIds: string[];
   lastCellKey: string;
-}
-
-interface DragState {
-  token: TokenDrag | null;
-  visual: Visual | null;
 }
 
 let ranges: RangeDef[] = [];
@@ -198,83 +194,6 @@ function buildRangeItems(
   return items;
 }
 
-/** Zasięgi, linia pomiarowa i etykieta. Zwraca null, gdy siatka nie jest heksagonalna. */
-async function setupVisual(
-  event: ToolEvent,
-  token: Item | undefined,
-  mySession: number
-): Promise<Visual | null> {
-  const gridType = await OBR.scene.grid.getType();
-  if (!gridType.startsWith("HEX")) {
-    await OBR.notification.show(
-      "Zasięgi hex działają tylko na siatce heksagonalnej (Hex).",
-      "WARNING"
-    );
-    return null;
-  }
-
-  const [dpi, currentRanges] = await Promise.all([
-    OBR.scene.grid.getDpi(),
-    loadRanges().catch(() => ranges),
-  ]);
-  ranges = currentRanges;
-
-  const rawOrigin = token ? token.position : event.pointerPosition;
-  const origin = await OBR.scene.grid.snapPosition(rawOrigin, 1, false, true);
-  const orientation = await detectOrientation(origin, dpi, gridType);
-  if (mySession !== session) return null;
-
-  const rangeItems = buildRangeItems(
-    origin,
-    orientation,
-    dpi,
-    currentRanges.filter((r) => r.visible)
-  );
-
-  const ruler = buildPath()
-    .commands(lineCommands(origin, origin))
-    .fillOpacity(0)
-    .strokeColor("#ffffff")
-    .strokeOpacity(0.9)
-    .strokeWidth(Math.max(3, dpi * 0.035))
-    .strokeDash([dpi * 0.12, dpi * 0.1])
-    .position({ x: 0, y: 0 })
-    .layer("DRAWING")
-    .locked(true)
-    .disableHit(true)
-    .zIndex(1000)
-    .build();
-
-  const label = buildLabel()
-    .plainText("0")
-    .position({ x: origin.x, y: origin.y - dpi * 0.7 })
-    .layer("TEXT")
-    .locked(true)
-    .disableHit(true)
-    .zIndex(1001)
-    .build();
-
-  const all: Item[] = [...rangeItems, ruler, label];
-  await OBR.scene.local.addItems(all);
-
-  const ids = all.map((i) => i.id);
-  if (mySession !== session) {
-    // Drag skończył się zanim dodaliśmy elementy, więc sprzątamy od razu.
-    await removeLocal(ids);
-    return null;
-  }
-
-  return {
-    origin,
-    orientation,
-    dpi,
-    rulerId: ruler.id,
-    labelId: label.id,
-    ids,
-    lastCellKey: "0,0",
-  };
-}
-
 // ------------------------------------------------------------- ruch w trakcie
 
 async function applyMove(pointer: Vector2) {
@@ -282,50 +201,47 @@ async function applyMove(pointer: Vector2) {
   if (!state) return;
 
   let measured: Vector2 = pointer;
+  let tokenMoved = false;
 
-  const token = state.token;
-  if (token) {
-    const wanted = { x: pointer.x + token.grab.x, y: pointer.y + token.grab.y };
+  if (state.tokenId) {
+    const wanted = { x: pointer.x + state.grab.x, y: pointer.y + state.grab.y };
     const snapped = await OBR.scene.grid.snapPosition(wanted);
     if (drag !== state) return;
-    token.lastPosition = snapped;
-    token.update((draft) => {
-      draft.position = snapped;
-    });
+    tokenMoved = snapped.x !== state.lastPosition.x || snapped.y !== state.lastPosition.y;
+    state.lastPosition = snapped;
     measured = snapped;
   }
 
-  const visual = state.visual;
-  if (!visual) return;
-
   const cell = offsetToAxial(
-    measured.x - visual.origin.x,
-    measured.y - visual.origin.y,
-    visual.orientation,
-    visual.dpi
+    measured.x - state.origin.x,
+    measured.y - state.origin.y,
+    state.orientation,
+    state.dpi
   );
   const key = `${cell.q},${cell.r}`;
-  if (key === visual.lastCellKey) return; // aktualizujemy tylko przy przejściu do innej komórki
-  visual.lastCellKey = key;
+  const cellChanged = key !== state.lastCellKey;
+  if (!tokenMoved && !cellChanged) return;
+  state.lastCellKey = key;
 
-  const center = cellCenter(visual.origin, cell, visual.orientation, visual.dpi);
+  const center = cellCenter(state.origin, cell, state.orientation, state.dpi);
   const distance = hexDistance(cell);
+  const tokenPosition = state.lastPosition;
 
-  try {
-    await OBR.scene.local.updateItems([visual.rulerId, visual.labelId], (items) => {
-      for (const item of items) {
-        if (item.id === visual.rulerId) {
-          (item as Path).commands = lineCommands(visual.origin, center);
-        } else if (item.id === visual.labelId) {
-          const label = item as Label;
-          label.text.plainText = String(distance);
-          label.position = { x: center.x, y: center.y - visual.dpi * 0.7 };
-        }
+  // Jedno wywołanie aktualizuje naraz token, linię i etykietę (tak samo jak w innych rozszerzeniach
+  // przeciągających tokeny), więc wszystko rusza się razem i na żywo.
+  state.update((items) => {
+    for (const item of items) {
+      if (item.id === state.tokenId) {
+        item.position = tokenPosition;
+      } else if (item.id === state.rulerId) {
+        (item as Path).commands = lineCommands(state.origin, center);
+      } else if (item.id === state.labelId) {
+        const label = item as Label;
+        label.text.plainText = String(distance);
+        label.position = { x: center.x, y: center.y - state.dpi * 0.7 };
       }
-    });
-  } catch {
-    // elementy mogły zniknąć (np. koniec dragu), ignorujemy
-  }
+    }
+  });
 }
 
 /** Zawsze przetwarzamy tylko najnowszą pozycję kursora, żeby nie budować kolejki opóźnień. */
@@ -354,22 +270,26 @@ async function finishDrag(commit: boolean, finalPointer?: Vector2) {
   if (inFlight) await inFlight;
 
   if (state && commit && finalPointer && drag === state) {
-    await applyMove(finalPointer);
+    try {
+      await applyMove(finalPointer);
+    } catch (error) {
+      console.error("[Hex Ranges] ostatni ruch", error);
+    }
   }
 
   session++;
   drag = null;
   if (!state) return;
 
-  const token = state.token;
-  if (token) {
+  if (state.tokenId) {
     const moved =
-      token.lastPosition.x !== token.startPosition.x ||
-      token.lastPosition.y !== token.startPosition.y;
+      state.lastPosition.x !== state.startPosition.x ||
+      state.lastPosition.y !== state.startPosition.y;
     if (commit && moved) {
       try {
-        const finalPosition = token.lastPosition;
-        await OBR.scene.items.updateItems([token.id], (items) => {
+        const finalPosition = state.lastPosition;
+        const id = state.tokenId;
+        await OBR.scene.items.updateItems([id], (items) => {
           for (const item of items) {
             item.position = finalPosition;
           }
@@ -378,10 +298,15 @@ async function finishDrag(commit: boolean, finalPointer?: Vector2) {
         console.error("[Hex Ranges] nie udało się zapisać pozycji tokenu", error);
       }
     }
-    token.stop();
   }
 
-  if (state.visual) await removeLocal(state.visual.ids);
+  // Zatrzymanie interakcji usuwa też tymczasową linię i etykietę.
+  try {
+    state.stop();
+  } catch {
+    // interakcja mogła już wygasnąć
+  }
+  await removeLocal(state.localIds);
 }
 
 // ------------------------------------------------------------ zdarzenia narzędzia
@@ -391,42 +316,111 @@ async function onDragStart(_ctx: ToolContext, event: ToolEvent) {
   const mySession = session;
   const target = event.target;
   const movable = !event.transformer && isMovable(target);
+  const token = movable ? target : undefined;
 
   try {
-    const state: DragState = { token: null, visual: null };
-
-    // Token ruszamy od razu, zanim jeszcze narysujemy zasięgi.
-    if (movable && target) {
-      const [update, stop] = (await OBR.interaction.startItemInteraction(
-        target
-      )) as unknown as ItemInteraction;
-      if (mySession !== session) {
-        stop();
-        return;
-      }
-      state.token = {
-        id: target.id,
-        update,
-        stop,
-        grab: {
-          x: target.position.x - event.pointerPosition.x,
-          y: target.position.y - event.pointerPosition.y,
-        },
-        startPosition: { ...target.position },
-        lastPosition: { ...target.position },
-      };
-      drag = state;
+    const gridType = await OBR.scene.grid.getType();
+    if (!gridType.startsWith("HEX")) {
+      await OBR.notification.show(
+        "Zasięgi hex działają tylko na siatce heksagonalnej (Hex).",
+        "WARNING"
+      );
+      return;
     }
 
-    const visual = await setupVisual(event, movable ? target : undefined, mySession);
+    const [dpi, currentRanges] = await Promise.all([
+      OBR.scene.grid.getDpi(),
+      loadRanges().catch(() => ranges),
+    ]);
+    ranges = currentRanges;
+
+    const rawOrigin = token ? token.position : event.pointerPosition;
+    const origin = await OBR.scene.grid.snapPosition(rawOrigin, 1, false, true);
+    const orientation = await detectOrientation(origin, dpi, gridType);
     if (mySession !== session) return;
 
-    if (visual) {
-      state.visual = visual;
-      drag = state;
+    const ruler = buildPath()
+      .commands(lineCommands(origin, origin))
+      .fillOpacity(0)
+      .strokeColor("#ffffff")
+      .strokeOpacity(0.9)
+      .strokeWidth(Math.max(3, dpi * 0.035))
+      .strokeDash([dpi * 0.12, dpi * 0.1])
+      .position({ x: 0, y: 0 })
+      .layer("DRAWING")
+      .locked(true)
+      .disableHit(true)
+      .zIndex(1000)
+      .build();
+
+    const label = buildLabel()
+      .plainText("0")
+      .position({ x: origin.x, y: origin.y - dpi * 0.7 })
+      .layer("TEXT")
+      .locked(true)
+      .disableHit(true)
+      .zIndex(1001)
+      .build();
+
+    // Token (jeśli jest) i znaczniki pomiaru w jednej interakcji: ruszają się na żywo,
+    // a po stop() znikają razem. Interakcję startujemy PRZED ciężkim rysowaniem zasięgów,
+    // żeby token od razu reagował na mysz.
+    const interactionItems: Item[] = token ? [token, ruler, label] : [ruler, label];
+    const [update, stop] = (await OBR.interaction.startItemInteraction(
+      interactionItems
+    )) as unknown as [InteractionUpdate, InteractionStop];
+
+    if (mySession !== session) {
+      stop();
+      return;
+    }
+
+    const state: DragState = {
+      update,
+      stop,
+      tokenId: token ? token.id : null,
+      grab: token
+        ? {
+            x: token.position.x - event.pointerPosition.x,
+            y: token.position.y - event.pointerPosition.y,
+          }
+        : { x: 0, y: 0 },
+      startPosition: token ? { ...token.position } : { x: 0, y: 0 },
+      lastPosition: token ? { ...token.position } : { x: 0, y: 0 },
+      origin,
+      orientation,
+      dpi,
+      rulerId: ruler.id,
+      labelId: label.id,
+      localIds: [],
+      lastCellKey: "0,0",
+    };
+    drag = state;
+
+    // Zasięgi (statyczne, tylko dla mnie) dodajemy po starcie ruchu.
+    const rangeItems = buildRangeItems(
+      origin,
+      orientation,
+      dpi,
+      currentRanges.filter((r) => r.visible)
+    );
+    state.localIds = rangeItems.map((i) => i.id);
+    await OBR.scene.local.addItems(rangeItems);
+
+    if (mySession !== session) {
+      // Drag skończył się w trakcie dodawania, więc sprzątamy od razu.
+      await removeLocal(state.localIds);
     }
   } catch (error) {
     console.error("[Hex Ranges] start", error);
+    try {
+      await OBR.notification.show(
+        "Hex Ranges: nie udało się rozpocząć przeciągania (szczegóły w konsoli).",
+        "ERROR"
+      );
+    } catch {
+      // brak powiadomień, trudno
+    }
   }
 }
 
@@ -471,14 +465,14 @@ OBR.onReady(async () => {
     onDeactivate,
   });
 
-  // Ustawienia zasięgów: przycisk widoczny tylko, gdy aktywny jest nasz tryb.
+  // Ustawienia zasięgów: przycisk widoczny na pasku narzędzia Measure.
   await OBR.tool.createAction({
     id: SETTINGS_ACTION_ID,
     icons: [
       {
         icon: SETTINGS_ICON,
-        label: "Ustawienia zasięgów",
-        filter: { activeTools: [MEASURE_TOOL_ID], activeModes: [MODE_ID] },
+        label: "Ustawienia zasięgów hex",
+        filter: { activeTools: [MEASURE_TOOL_ID] },
       },
     ],
     onClick(_ctx, elementId) {
