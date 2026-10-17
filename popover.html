@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hex Ranges</title>
+    <link rel="stylesheet" href="/src/popover.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Zasięgi hex</h1>
+        <p class="hint">
+          Wybierz Measure → „Zasięgi hex" i przeciągnij token (zasięgi zostają w miejscu startu)
+          albo dowolny punkt na mapie.
+        </p>
+      </header>
+
+      <ul id="list" aria-label="Lista zasięgów"></ul>
+
+      <div class="actions">
+        <button id="add" type="button">Dodaj zasięg</button>
+        <button id="reset" type="button" class="secondary">Przywróć domyślne</button>
+      </div>
+
+      <p id="status" role="status"></p>
+    </main>
+    <script type="module" src="/src/popover.ts"></script>
+  </body>
+</html>

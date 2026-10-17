@@ -1,0 +1,9 @@
+{
+  "name": "Hex Ranges",
+  "version": "1.1.0",
+  "manifest_version": 1,
+  "author": "Hex Ranges",
+  "description": "Dodaje do narzędzia Measure tryb pokazujący zasięg ruchu, ataku i czarów na siatce hex. Kolory i wartości zasięgów można zmieniać.",
+  "icon": "/ColorHexes/icon.svg",
+  "background_url": "/ColorHexes/background.html"
+}
