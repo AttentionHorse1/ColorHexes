@@ -5,24 +5,29 @@ Każdy zasięg ma własną nazwę, liczbę heksów i kolor, a listę można dowo
 
 ## Użycie
 
+Działa tak jak oficjalne rozszerzenie Ranges, tylko na siatce heksagonalnej.
+
 1. Na pasku narzędzi wybierz **Measure**, a w jego menu tryb **Zasięgi hex** (obok Ruler, Movement itd.).
-2. Przeciągnij token. Rusza się od razu za myszką (z przyciąganiem do siatki), a zasięgi zostają w miejscu startu.
-   Linia pokazuje drogę, a etykieta liczbę heksów od punktu startu.
-3. Przeciągnięcie z pustego miejsca na mapie robi to samo bez przesuwania czegokolwiek (sam pomiar).
-4. Gdy aktywne jest narzędzie **Measure**, na pasku jest przycisk **Ustawienia zasięgów** (suwaki).
-   Tam zmieniasz nazwy, liczby heksów, kolory, widoczność oraz dodajesz i usuwasz zasięgi.
+2. Naciśnij i przeciągnij **token**: rusza się od razu za myszką (z przyciąganiem do siatki), a kolorowe zasięgi
+   zostają w miejscu startu, więc widać, ile pól token przeszedł.
+3. Naciśnij i przeciągnij **puste miejsce**: zasięgi podążają za kursorem (sam pomiar, nic się nie przesuwa).
+4. Na pasku narzędzia Measure jest też przycisk **Ustawienia zasięgów hex** (suwaki). Tam zmieniasz nazwy,
+   liczby heksów, kolory, widoczność oraz dodajesz i usuwasz zasięgi.
 
 Każdy zasięg jest osobnym pierścieniem (komórki między poprzednim a tym zasięgiem), więc kolory się nie nakładają ani nie mieszają.
-Kolorowe zasięgi widzisz tylko Ty; linię pomiaru i liczbę heksów widzą też inni gracze, tak jak ruch tokenu. Działa tylko na scenach z siatką **Hex**; ustawienia zapisują się w metadanych pokoju.
+Nad każdym zasięgiem jest etykieta z nazwą i odległością (liczba heksów razy skala siatki, np. 30ft).
+Zasięgi widzisz tylko Ty (elementy lokalne), a ruch tokenu widzą wszyscy. Działa tylko na scenach z siatką **Hex**;
+ustawienia zapisują się w metadanych pokoju.
 
-Przeciągane są tokeny z warstw Character, Mount i Prop, które nie są zablokowane. Przesuwany jest jeden token naraz.
+Przeciągane są tokeny z warstw Character, Mount i Prop, które nie są zablokowane i które możesz przesuwać według uprawnień pokoju.
 
 ## Uruchomienie lokalne
 
 ```bash
 npm install
 npm test          # testy geometrii heksów
-npm run build     # sprawdzenie typów + build
+npm run build     # build do folderu dist/
+npm run typecheck # opcjonalna kontrola typów
 npm run dev       # serwer na http://localhost:5173
 ```
 
@@ -45,7 +50,7 @@ Po aktualizacji rozszerzenia usuń je w Owlbear i dodaj ponownie (albo odśwież
 | Plik | Rola |
 | --- | --- |
 | `public/manifest.json` | Manifest rozszerzenia (tylko strona w tle) |
-| `src/background.ts` | Tryb w Measure, akcja ustawień, przesuwanie tokenu, rysowanie zasięgów |
+| `src/background.ts` | Tryb w Measure, przycisk ustawień, przesuwanie tokenu, rysowanie zasięgów |
 | `src/popover.ts`, `popover.html`, `src/popover.css` | Okno ustawień |
 | `src/shared.ts` | Typy, wartości domyślne, zapis ustawień w metadanych pokoju |
 | `src/hex.ts` | Czysta geometria heksów (bez SDK) |

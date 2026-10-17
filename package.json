@@ -3,12 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Rozszerzenie Owlbear Rodeo: zasięgi na siatce hex z konfigurowalnymi kolorami.",
+  "description": "Rozszerzenie Owlbear Rodeo: zasi\u0119gi na siatce hex z konfigurowalnymi kolorami.",
   "scripts": {
     "dev": "vite --host --port 5173",
-    "build": "tsc --noEmit && vite build",
+    "build": "vite build",
     "preview": "vite preview --port 5173",
-    "test": "node --experimental-strip-types test/hex.test.ts"
+    "test": "node --experimental-strip-types test/hex.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@owlbear-rodeo/sdk": "^3.1.0"

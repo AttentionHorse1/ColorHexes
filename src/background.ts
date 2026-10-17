@@ -3,22 +3,12 @@ import OBR, {
   buildPath,
   Command,
   type Item,
-  type Label,
-  type Path,
   type PathCommand,
   type ToolContext,
   type ToolEvent,
   type Vector2,
 } from "@owlbear-rodeo/sdk";
-import {
-  areaPolygons,
-  boundarySegments,
-  cellCenter,
-  hexDistance,
-  offsetToAxial,
-  type Orientation,
-  type Point,
-} from "./hex.ts";
+import { areaPolygons, boundarySegments, type Orientation, type Point } from "./hex.ts";
 import {
   loadRanges,
   MEASURE_TOOL_ID,
@@ -29,58 +19,51 @@ import {
   type RangeDef,
 } from "./shared.ts";
 
+// Działanie wzorowane na oficjalnym rozszerzeniu "Ranges":
+//  - Naciśnięcie myszy (onToolDown) rysuje zasięgi (lokalne elementy, widoczne tylko dla Ciebie).
+//  - Jeśli naciśnięto token, to jego przeciąganie jest osobną interakcją (ruch na żywo),
+//    a zasięgi zostają w miejscu startu.
+//  - Jeśli naciśnięto puste miejsce, zasięgi podążają za kursorem.
+
 /** Ikony i popover z uwzględnieniem podfolderu hostingu (base z vite.config.ts). */
 const BASE = import.meta.env.BASE_URL;
 const ICON = `${BASE}icon.svg`;
 const SETTINGS_ICON = `${BASE}settings.svg`;
 const POPOVER_URL = `${BASE}popover.html`;
 
-/** Warstwy, których elementy traktujemy jak tokeny (można je przeciągać). */
+/** Warstwy, których elementy można przeciągać. */
 const MOVABLE_LAYERS: string[] = ["CHARACTER", "MOUNT", "PROP"];
 
 const FILL_OPACITY = 0.3;
 
-/** Wynik OBR.interaction.startItemInteraction dla listy elementów. */
-type InteractionUpdate = (recipe: (items: Item[]) => void) => Item[];
-type InteractionStop = () => void;
+type TokenInteraction = [(recipe: (item: Item) => void) => unknown, () => void];
 
-interface DragState {
-  update: InteractionUpdate;
-  stop: InteractionStop;
-  /** Id przeciąganego tokenu (null przy samym pomiarze z pustego miejsca). */
-  tokenId: string | null;
-  /** Różnica: pozycja tokenu minus pozycja kursora w chwili chwycenia. */
-  grab: Vector2;
-  startPosition: Vector2;
-  lastPosition: Vector2;
+interface Visual {
+  ids: string[];
+  /** Przesunięcie każdego elementu względem środka zasięgów. */
+  offsets: Map<string, Vector2>;
   origin: Point;
   orientation: Orientation;
   dpi: number;
-  rulerId: string;
-  labelId: string;
-  /** Lokalne (prywatne) elementy zasięgów, które trzeba usunąć na końcu. */
-  localIds: string[];
-  lastCellKey: string;
 }
 
 let ranges: RangeDef[] = [];
-let drag: DragState | null = null;
-/** Zwiększany przy każdym starcie/końcu, żeby odrzucić spóźnione wyniki wywołań asynchronicznych. */
+
+/** Zwiększany przy każdym czyszczeniu, żeby odrzucić spóźnione wyniki wywołań asynchronicznych. */
 let session = 0;
 
-let pending: Vector2 | null = null;
-let working: Promise<void> | null = null;
+let downTarget: Item | null = null;
+let grabOffset: Vector2 = { x: 0, y: 0 };
+let tokenInteraction: TokenInteraction | null = null;
+let tokenStart: Vector2 | null = null;
+let tokenLast: Vector2 | null = null;
+let visual: Visual | null = null;
+
+let lastPointer: Vector2 | null = null;
+let pendingPointer: Vector2 | null = null;
+let moving: Promise<void> | null = null;
 
 // ---------------------------------------------------------------- pomocnicze
-
-function isMovable(target: Item | undefined): target is Item {
-  return (
-    !!target &&
-    target.type === "IMAGE" &&
-    !target.locked &&
-    MOVABLE_LAYERS.includes(target.layer)
-  );
-}
 
 /**
  * Orientacja siatki wykrywana z samej siatki: jeśli punkt oddalony o `dpi` w poziomie
@@ -104,7 +87,7 @@ async function detectOrientation(
   }
 }
 
-function polygonCommands(polygons: Point[][]): PathCommand[] {
+function lineCommandsFromPolygons(polygons: Point[][]): PathCommand[] {
   const cmds: PathCommand[] = [];
   for (const poly of polygons) {
     poly.forEach((p, i) => {
@@ -124,11 +107,39 @@ function segmentCommands(segments: [Point, Point][]): PathCommand[] {
   return cmds;
 }
 
-function lineCommands(a: Point, b: Point): PathCommand[] {
-  return [
-    [Command.MOVE, a.x, a.y] as PathCommand,
-    [Command.LINE, b.x, b.y] as PathCommand,
-  ];
+function isMovableCandidate(target: Item | undefined, transformer: boolean): target is Item {
+  return (
+    !!target &&
+    !transformer &&
+    target.type === "IMAGE" &&
+    !target.locked &&
+    MOVABLE_LAYERS.includes(target.layer)
+  );
+}
+
+/** Czy bieżący gracz może przesuwać ten element (GM zawsze, gracz według uprawnień pokoju). */
+async function canUpdateItem(item: Item): Promise<boolean> {
+  try {
+    const role = await OBR.player.getRole();
+    if (role === "GM") return true;
+
+    const permissions: Record<string, string> = {
+      CHARACTER: "CHARACTER_UPDATE",
+      MOUNT: "MOUNT_UPDATE",
+      PROP: "PROP_UPDATE",
+    };
+    const permission = permissions[item.layer];
+    if (!permission) return false;
+    if (!(await OBR.player.hasPermission(permission as never))) return false;
+
+    if (item.layer === "CHARACTER" && (await OBR.player.hasPermission("CHARACTER_OWNER_ONLY" as never))) {
+      return item.createdUserId === OBR.player.id;
+    }
+    return true;
+  } catch (error) {
+    console.error("[Hex Ranges] sprawdzanie uprawnień", error);
+    return false;
+  }
 }
 
 async function removeLocal(ids: string[]) {
@@ -145,31 +156,35 @@ async function removeLocal(ids: string[]) {
 /**
  * Każdy zasięg to osobny pierścień: wypełnione są tylko komórki między poprzednim
  * (mniejszym) a tym zasięgiem. Dzięki temu kolory się nie nakładają i nie mieszają.
+ * Kształty są zbudowane względem punktu (0, 0), a na miejsce ustawia je `position`.
  */
 function buildRangeItems(
   origin: Point,
   orientation: Orientation,
   dpi: number,
-  visibleRanges: RangeDef[]
-): Item[] {
+  visibleRanges: RangeDef[],
+  distanceText: (cells: number) => string
+): { items: Item[]; offsets: Map<string, Vector2> } {
+  const zero = { x: 0, y: 0 };
   const sorted = [...visibleRanges].sort((a, b) => a.cells - b.cells);
   const items: Item[] = [];
+  const offsets = new Map<string, Vector2>();
   let previousCells = -1;
   let z = 0;
 
   for (const range of sorted) {
-    const band = areaPolygons(origin, range.cells, orientation, dpi, previousCells);
+    const band = areaPolygons(zero, range.cells, orientation, dpi, previousCells);
     previousCells = Math.max(previousCells, range.cells);
     if (band.length === 0) continue; // ten sam rozmiar co poprzedni zasięg
 
     const fill = buildPath()
-      .commands(polygonCommands(band))
+      .commands(lineCommandsFromPolygons(band))
       .fillRule("nonzero")
       .fillColor(range.color)
       .fillOpacity(FILL_OPACITY)
       .strokeOpacity(0)
       .strokeWidth(0)
-      .position({ x: 0, y: 0 })
+      .position(origin)
       .layer("DRAWING")
       .locked(true)
       .disableHit(true)
@@ -177,12 +192,12 @@ function buildRangeItems(
       .build();
 
     const outline = buildPath()
-      .commands(segmentCommands(boundarySegments(origin, range.cells, orientation, dpi)))
+      .commands(segmentCommands(boundarySegments(zero, range.cells, orientation, dpi)))
       .fillOpacity(0)
       .strokeColor(range.color)
       .strokeOpacity(0.95)
       .strokeWidth(Math.max(3, dpi * 0.04))
-      .position({ x: 0, y: 0 })
+      .position(origin)
       .layer("DRAWING")
       .locked(true)
       .disableHit(true)
@@ -190,86 +205,142 @@ function buildRangeItems(
       .build();
 
     items.push(fill, outline);
+    offsets.set(fill.id, { x: 0, y: 0 });
+    offsets.set(outline.id, { x: 0, y: 0 });
+
+    // Etykieta z nazwą i odległością nad zasięgiem (pomijana, jeśli budowanie się nie powiedzie).
+    try {
+      const top =
+        orientation === "pointy"
+          ? range.cells * dpi * (Math.sqrt(3) / 2) + dpi * 0.58
+          : range.cells * dpi + dpi * 0.5;
+      const offset = { x: 0, y: -(top + dpi * 0.3) };
+      const text = [range.name.trim(), distanceText(range.cells)].filter(Boolean).join(" ");
+      const label = buildLabel()
+        .plainText(text)
+        .position({ x: origin.x + offset.x, y: origin.y + offset.y })
+        .layer("TEXT")
+        .locked(true)
+        .disableHit(true)
+        .zIndex(1000 + z)
+        .build();
+      items.push(label);
+      offsets.set(label.id, offset);
+    } catch (error) {
+      console.warn("[Hex Ranges] etykieta pominięta", error);
+    }
   }
-  return items;
+  return { items, offsets };
+}
+
+async function setupVisual(event: ToolEvent, mySession: number) {
+  const gridType = await OBR.scene.grid.getType();
+  if (!gridType.startsWith("HEX")) {
+    await OBR.notification.show(
+      "Zasięgi hex działają tylko na siatce heksagonalnej (Hex).",
+      "WARNING"
+    );
+    return;
+  }
+
+  const [dpi, currentRanges, scale] = await Promise.all([
+    OBR.scene.grid.getDpi(),
+    loadRanges().catch(() => ranges),
+    OBR.scene.grid.getScale().catch(() => null),
+  ]);
+  ranges = currentRanges;
+
+  const rawOrigin = downTarget ? downTarget.position : event.pointerPosition;
+  const origin = await OBR.scene.grid.snapPosition(rawOrigin, 1, false, true);
+  const orientation = await detectOrientation(origin, dpi, gridType);
+  if (mySession !== session) return;
+
+  const multiplier = scale?.parsed?.multiplier ?? 1;
+  const unit = scale?.parsed?.unit ?? "";
+  const distanceText = (cells: number) => {
+    const value = Math.round(cells * multiplier * 100) / 100;
+    return `${value}${unit}`;
+  };
+
+  const { items, offsets } = buildRangeItems(
+    origin,
+    orientation,
+    dpi,
+    currentRanges.filter((r) => r.visible),
+    distanceText
+  );
+  const ids = items.map((i) => i.id);
+  await OBR.scene.local.addItems(items);
+
+  if (mySession !== session) {
+    await removeLocal(ids); // tymczasem ruch się skończył
+    return;
+  }
+  visual = { ids, offsets, origin, orientation, dpi };
+  if (lastPointer) scheduleMove(lastPointer); // nadrabiamy ruch z czasu przygotowań
 }
 
 // ------------------------------------------------------------- ruch w trakcie
 
 async function applyMove(pointer: Vector2) {
-  const state = drag;
-  if (!state) return;
+  const mySession = session;
 
-  let measured: Vector2 = pointer;
-  let tokenMoved = false;
-
-  if (state.tokenId) {
-    const wanted = { x: pointer.x + state.grab.x, y: pointer.y + state.grab.y };
-    const snapped = await OBR.scene.grid.snapPosition(wanted);
-    if (drag !== state) return;
-    tokenMoved = snapped.x !== state.lastPosition.x || snapped.y !== state.lastPosition.y;
-    state.lastPosition = snapped;
-    measured = snapped;
+  if (downTarget) {
+    // Token: przyciągamy do siatki i aktualizujemy interakcję (zasięgi zostają na miejscu).
+    const interaction = tokenInteraction;
+    if (!interaction) return;
+    const position = await OBR.scene.grid.snapPosition({
+      x: pointer.x - grabOffset.x,
+      y: pointer.y - grabOffset.y,
+    });
+    if (mySession !== session || tokenInteraction !== interaction) return;
+    tokenLast = position;
+    interaction[0]((item) => {
+      item.position = position;
+    });
+    return;
   }
 
-  const cell = offsetToAxial(
-    measured.x - state.origin.x,
-    measured.y - state.origin.y,
-    state.orientation,
-    state.dpi
-  );
-  const key = `${cell.q},${cell.r}`;
-  const cellChanged = key !== state.lastCellKey;
-  if (!tokenMoved && !cellChanged) return;
-  state.lastCellKey = key;
-
-  const center = cellCenter(state.origin, cell, state.orientation, state.dpi);
-  const distance = hexDistance(cell);
-  const tokenPosition = state.lastPosition;
-
-  // Jedno wywołanie aktualizuje naraz token, linię i etykietę (tak samo jak w innych rozszerzeniach
-  // przeciągających tokeny), więc wszystko rusza się razem i na żywo.
-  state.update((items) => {
+  // Pusty punkt: zasięgi podążają za kursorem.
+  const current = visual;
+  if (!current) return;
+  const origin = await OBR.scene.grid.snapPosition(pointer, 1, false, true);
+  if (mySession !== session || visual !== current) return;
+  if (origin.x === current.origin.x && origin.y === current.origin.y) return;
+  current.origin = origin;
+  await OBR.scene.local.updateItems(current.ids, (items) => {
     for (const item of items) {
-      if (item.id === state.tokenId) {
-        item.position = tokenPosition;
-      } else if (item.id === state.rulerId) {
-        (item as Path).commands = lineCommands(state.origin, center);
-      } else if (item.id === state.labelId) {
-        const label = item as Label;
-        label.text.plainText = String(distance);
-        label.position = { x: center.x, y: center.y - state.dpi * 0.7 };
-      }
+      const offset = current.offsets.get(item.id) ?? { x: 0, y: 0 };
+      item.position = { x: origin.x + offset.x, y: origin.y + offset.y };
     }
   });
 }
 
 /** Zawsze przetwarzamy tylko najnowszą pozycję kursora, żeby nie budować kolejki opóźnień. */
 function scheduleMove(pointer: Vector2) {
-  pending = pointer;
-  if (working) return;
-  working = (async () => {
+  pendingPointer = pointer;
+  if (moving) return;
+  moving = (async () => {
     try {
-      while (pending && drag) {
-        const next = pending;
-        pending = null;
+      while (pendingPointer) {
+        const next = pendingPointer;
+        pendingPointer = null;
         await applyMove(next);
       }
     } catch (error) {
-      console.error("[Hex Ranges] move", error);
+      console.error("[Hex Ranges] ruch", error);
     } finally {
-      working = null;
+      moving = null;
     }
   })();
 }
 
-async function finishDrag(commit: boolean, finalPointer?: Vector2) {
-  pending = null;
-  const state = drag;
-  const inFlight = working;
+/** Zapisuje końcową pozycję tokenu w scenie (jeśli się ruszył). */
+async function finalizeMove(finalPointer?: Vector2) {
+  const inFlight = moving;
   if (inFlight) await inFlight;
 
-  if (state && commit && finalPointer && drag === state) {
+  if (downTarget && tokenInteraction && finalPointer) {
     try {
       await applyMove(finalPointer);
     } catch (error) {
@@ -277,212 +348,195 @@ async function finishDrag(commit: boolean, finalPointer?: Vector2) {
     }
   }
 
-  session++;
-  drag = null;
-  if (!state) return;
+  const target = downTarget;
+  const start = tokenStart;
+  const last = tokenLast;
+  if (!target || !tokenInteraction || !start || !last) return;
+  if (last.x === start.x && last.y === start.y) return;
 
-  if (state.tokenId) {
-    const moved =
-      state.lastPosition.x !== state.startPosition.x ||
-      state.lastPosition.y !== state.startPosition.y;
-    if (commit && moved) {
-      try {
-        const finalPosition = state.lastPosition;
-        const id = state.tokenId;
-        await OBR.scene.items.updateItems([id], (items) => {
-          for (const item of items) {
-            item.position = finalPosition;
-          }
-        });
-      } catch (error) {
-        console.error("[Hex Ranges] nie udało się zapisać pozycji tokenu", error);
+  try {
+    await OBR.scene.items.updateItems([target.id], (items) => {
+      for (const item of items) {
+        item.position = last;
       }
+    });
+  } catch (error) {
+    console.error("[Hex Ranges] nie udało się zapisać pozycji tokenu", error);
+  }
+}
+
+function cleanup() {
+  session++;
+  pendingPointer = null;
+
+  const interaction = tokenInteraction;
+  tokenInteraction = null;
+  if (interaction) {
+    try {
+      interaction[1]();
+    } catch {
+      // interakcja mogła już wygasnąć
     }
   }
 
-  // Zatrzymanie interakcji usuwa też tymczasową linię i etykietę.
-  try {
-    state.stop();
-  } catch {
-    // interakcja mogła już wygasnąć
-  }
-  await removeLocal(state.localIds);
+  const current = visual;
+  visual = null;
+  if (current) void removeLocal(current.ids);
+
+  downTarget = null;
+  tokenStart = null;
+  tokenLast = null;
 }
 
 // ------------------------------------------------------------ zdarzenia narzędzia
 
-async function onDragStart(_ctx: ToolContext, event: ToolEvent) {
-  await finishDrag(false);
+async function onToolDown(_ctx: ToolContext, event: ToolEvent) {
+  cleanup();
   const mySession = session;
+  lastPointer = event.pointerPosition;
+
+  // Wszystko, co decyduje o tokenie, ustalamy od razu (synchronicznie), zanim zaczną się
+  // opóźnienia asynchroniczne, żeby późniejszy start przeciągania wiedział, co ruszać.
   const target = event.target;
-  const movable = !event.transformer && isMovable(target);
-  const token = movable ? target : undefined;
+  if (isMovableCandidate(target, event.transformer)) {
+    downTarget = target;
+    tokenStart = { ...target.position };
+    tokenLast = { ...target.position };
+    grabOffset = {
+      x: event.pointerPosition.x - target.position.x,
+      y: event.pointerPosition.y - target.position.y,
+    };
+  }
 
   try {
-    const gridType = await OBR.scene.grid.getType();
-    if (!gridType.startsWith("HEX")) {
-      await OBR.notification.show(
-        "Zasięgi hex działają tylko na siatce heksagonalnej (Hex).",
-        "WARNING"
-      );
-      return;
-    }
-
-    const [dpi, currentRanges] = await Promise.all([
-      OBR.scene.grid.getDpi(),
-      loadRanges().catch(() => ranges),
-    ]);
-    ranges = currentRanges;
-
-    const rawOrigin = token ? token.position : event.pointerPosition;
-    const origin = await OBR.scene.grid.snapPosition(rawOrigin, 1, false, true);
-    const orientation = await detectOrientation(origin, dpi, gridType);
-    if (mySession !== session) return;
-
-    const ruler = buildPath()
-      .commands(lineCommands(origin, origin))
-      .fillOpacity(0)
-      .strokeColor("#ffffff")
-      .strokeOpacity(0.9)
-      .strokeWidth(Math.max(3, dpi * 0.035))
-      .strokeDash([dpi * 0.12, dpi * 0.1])
-      .position({ x: 0, y: 0 })
-      .layer("DRAWING")
-      .locked(true)
-      .disableHit(true)
-      .zIndex(1000)
-      .build();
-
-    const label = buildLabel()
-      .plainText("0")
-      .position({ x: origin.x, y: origin.y - dpi * 0.7 })
-      .layer("TEXT")
-      .locked(true)
-      .disableHit(true)
-      .zIndex(1001)
-      .build();
-
-    // Token (jeśli jest) i znaczniki pomiaru w jednej interakcji: ruszają się na żywo,
-    // a po stop() znikają razem. Interakcję startujemy PRZED ciężkim rysowaniem zasięgów,
-    // żeby token od razu reagował na mysz.
-    const interactionItems: Item[] = token ? [token, ruler, label] : [ruler, label];
-    const [update, stop] = (await OBR.interaction.startItemInteraction(
-      interactionItems
-    )) as unknown as [InteractionUpdate, InteractionStop];
-
-    if (mySession !== session) {
-      stop();
-      return;
-    }
-
-    const state: DragState = {
-      update,
-      stop,
-      tokenId: token ? token.id : null,
-      grab: token
-        ? {
-            x: token.position.x - event.pointerPosition.x,
-            y: token.position.y - event.pointerPosition.y,
-          }
-        : { x: 0, y: 0 },
-      startPosition: token ? { ...token.position } : { x: 0, y: 0 },
-      lastPosition: token ? { ...token.position } : { x: 0, y: 0 },
-      origin,
-      orientation,
-      dpi,
-      rulerId: ruler.id,
-      labelId: label.id,
-      localIds: [],
-      lastCellKey: "0,0",
-    };
-    drag = state;
-
-    // Zasięgi (statyczne, tylko dla mnie) dodajemy po starcie ruchu.
-    const rangeItems = buildRangeItems(
-      origin,
-      orientation,
-      dpi,
-      currentRanges.filter((r) => r.visible)
-    );
-    state.localIds = rangeItems.map((i) => i.id);
-    await OBR.scene.local.addItems(rangeItems);
-
-    if (mySession !== session) {
-      // Drag skończył się w trakcie dodawania, więc sprzątamy od razu.
-      await removeLocal(state.localIds);
-    }
+    await setupVisual(event, mySession);
   } catch (error) {
     console.error("[Hex Ranges] start", error);
     try {
       await OBR.notification.show(
-        "Hex Ranges: nie udało się rozpocząć przeciągania (szczegóły w konsoli).",
+        "Hex Ranges: nie udało się narysować zasięgów (szczegóły w konsoli).",
         "ERROR"
       );
     } catch {
-      // brak powiadomień, trudno
+      // brak powiadomień
     }
   }
 }
 
-function onDragMove(_ctx: ToolContext, event: ToolEvent) {
+async function onToolDragStart(_ctx: ToolContext, event: ToolEvent) {
+  lastPointer = event.pointerPosition;
+  const mySession = session;
+  const target = downTarget;
+  if (!target) return;
+
+  try {
+    if (!(await canUpdateItem(target))) {
+      if (mySession === session) downTarget = null; // bez uprawnień: tylko pomiar
+      return;
+    }
+    const interaction = (await OBR.interaction.startItemInteraction(
+      target
+    )) as unknown as TokenInteraction;
+    if (mySession !== session) {
+      interaction[1]();
+      return;
+    }
+    tokenInteraction = interaction;
+    scheduleMove(lastPointer); // zaczynamy od aktualnej pozycji kursora
+  } catch (error) {
+    console.error("[Hex Ranges] start przeciągania", error);
+  }
+}
+
+function onToolDragMove(_ctx: ToolContext, event: ToolEvent) {
+  lastPointer = event.pointerPosition;
   scheduleMove(event.pointerPosition);
 }
 
-async function onDragEnd(_ctx: ToolContext, event: ToolEvent) {
-  await finishDrag(true, event.pointerPosition);
+async function onToolEnd(_ctx: ToolContext, event: ToolEvent) {
+  const mySession = session;
+  await finalizeMove(event.pointerPosition);
+  if (mySession === session) cleanup();
 }
 
-async function onDragCancel() {
-  await finishDrag(false);
+function onToolDragCancel() {
+  cleanup();
 }
 
-async function onDeactivate() {
-  await finishDrag(false);
+function onDeactivate() {
+  cleanup();
 }
 
 // --------------------------------------------------------------- uruchomienie
 
-OBR.onReady(async () => {
-  ranges = await loadRanges().catch(() => []);
-  onRangesChange((next) => {
-    ranges = next;
-  });
+OBR.onReady(() => {
+  void (async () => {
+    ranges = await loadRanges().catch(() => []);
+    onRangesChange((next) => {
+      ranges = next;
+    });
 
-  // Tryb pojawia się na pasku narzędzia Measure obok Ruler, Movement itd.
-  await OBR.tool.createMode({
-    id: MODE_ID,
-    icons: [
-      {
-        icon: ICON,
-        label: "Zasięgi hex",
-        filter: { activeTools: [MEASURE_TOOL_ID] },
-      },
-    ],
-    onToolDragStart: onDragStart,
-    onToolDragMove: onDragMove,
-    onToolDragEnd: onDragEnd,
-    onToolDragCancel: onDragCancel,
-    onDeactivate,
-  });
+    // Tryb pojawia się na pasku narzędzia Measure obok Ruler, Movement itd.
+    await OBR.tool.createMode({
+      id: MODE_ID,
+      icons: [
+        {
+          icon: ICON,
+          label: "Zasięgi hex",
+          filter: { activeTools: [MEASURE_TOOL_ID] },
+        },
+      ],
+      cursors: [
+        {
+          cursor: "grabbing",
+          filter: { dragging: true, target: [{ key: "type", value: "IMAGE" }] },
+        },
+        {
+          cursor: "grab",
+          filter: {
+            target: [
+              { key: "type", value: "IMAGE" },
+              { key: "locked", value: false },
+            ],
+          },
+        },
+        { cursor: "crosshair" },
+      ],
+      // Pojedyncze kliknięcie nie zaznacza niczego (jak w oficjalnym Ranges).
+      onToolClick: () => false,
+      onToolDown,
+      onToolDragStart,
+      onToolDragMove,
+      onToolDragEnd: onToolEnd,
+      onToolUp: onToolEnd,
+      onToolDragCancel,
+      onDeactivate,
+    });
+  })().catch((error) => console.error("[Hex Ranges] tryb", error));
 
-  // Ustawienia zasięgów: przycisk widoczny na pasku narzędzia Measure.
-  await OBR.tool.createAction({
-    id: SETTINGS_ACTION_ID,
-    icons: [
-      {
-        icon: SETTINGS_ICON,
-        label: "Ustawienia zasięgów hex",
-        filter: { activeTools: [MEASURE_TOOL_ID] },
+  // Przycisk ustawień jest rejestrowany niezależnie od trybu (jak w oficjalnym Ranges),
+  // żeby błąd w jednym nie blokował drugiego.
+  void OBR.tool
+    .createAction({
+      id: SETTINGS_ACTION_ID,
+      icons: [
+        {
+          icon: SETTINGS_ICON,
+          label: "Ustawienia zasięgów hex",
+          filter: { activeTools: [MEASURE_TOOL_ID] },
+        },
+      ],
+      onClick(_ctx, elementId) {
+        void OBR.popover.open({
+          id: POPOVER_ID,
+          url: POPOVER_URL,
+          width: 360,
+          height: 440,
+          anchorElementId: elementId,
+          anchorOrigin: { horizontal: "CENTER", vertical: "BOTTOM" },
+          transformOrigin: { horizontal: "CENTER", vertical: "TOP" },
+        });
       },
-    ],
-    onClick(_ctx, elementId) {
-      void OBR.popover.open({
-        id: POPOVER_ID,
-        url: POPOVER_URL,
-        width: 360,
-        height: 440,
-        anchorElementId: elementId,
-      });
-    },
-  });
+    })
+    .catch((error) => console.error("[Hex Ranges] akcja ustawień", error));
 });
