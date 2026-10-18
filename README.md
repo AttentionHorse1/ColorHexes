@@ -55,3 +55,9 @@ Po aktualizacji rozszerzenia usuń je w Owlbear i dodaj ponownie (albo odśwież
 | `src/shared.ts` | Typy, wartości domyślne, zapis ustawień w metadanych pokoju |
 | `src/hex.ts` | Czysta geometria heksów (bez SDK) |
 | `test/hex.test.ts` | Testy geometrii |
+
+## Bezpieczeństwo ustawień i wydajność (aktualizacja)
+
+- Maksymalnie **20 definicji zasięgów** i **4096 bajtów** ustawień w Room Metadata. Istniejące krótkie konfiguracje działają bez migracji.
+- Jeśli drugi gracz zmieni ustawienia w czasie edycji, panel zatrzyma lokalny zapis i poprosi o ponowne otwarcie. To zabezpieczenie typu *best effort*: Owlbear SDK nie zapewnia atomowej blokady zapisu Room Metadata, więc wyścigi w bardzo wąskim oknie czasowym nadal są teoretycznie możliwe.
+- Obrysy zasięgów liczone są tylko na obwodzie (O(n), zamiast sprawdzania wszystkich pól O(n²)). Wypełnienia nadal są rysowane z pojedynczych heksów, aby nie zmieniać wyglądu. Duże zasięgi mogą więc nadal obciążać renderer.

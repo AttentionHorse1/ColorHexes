@@ -131,6 +131,23 @@ export function areaPolygons(
     .map((a) => hexCorners(cellCenter(origin, a, orientation, dpi), orientation, dpi));
 }
 
+/** Komórki na zewnętrznym obwodzie, zamiast całego dysku O(n²). */
+function rimCells(n: number): Axial[] {
+  if (n === 0) return [{ q: 0, r: 0 }];
+  const out: Axial[] = [];
+  for (let q = -n; q <= n; q++) {
+    const low = Math.max(-n, -q - n);
+    const high = Math.min(n, -q + n);
+    for (const r of new Set([low, high])) {
+      if (hexDistance({ q, r }) === n) out.push({ q, r });
+    }
+    if (q === -n || q === n) {
+      for (let r = low + 1; r < high; r++) out.push({ q, r });
+    }
+  }
+  return out;
+}
+
 /**
  * Zewnętrzny obrys obszaru: krawędzie, które należą tylko do jednej komórki.
  * Dla n >= 0 jest ich 6 * (2n + 1).
@@ -141,28 +158,18 @@ export function boundarySegments(
   orientation: Orientation,
   dpi: number
 ): Segment[] {
-  const key = (p: Point) => `${Math.round(p.x * 100)},${Math.round(p.y * 100)}`;
-  const edges = new Map<string, { seg: Segment; count: number }>();
-
-  for (const poly of areaPolygons(origin, n, orientation, dpi)) {
+  const out: Segment[] = [];
+  for (const cell of rimCells(n)) {
+    const center = cellCenter(origin, cell, orientation, dpi);
+    const poly = hexCorners(center, orientation, dpi);
     for (let i = 0; i < 6; i++) {
       const a = poly[i];
       const b = poly[(i + 1) % 6];
-      const ka = key(a);
-      const kb = key(b);
-      const k = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
-      const existing = edges.get(k);
-      if (existing) {
-        existing.count += 1;
-      } else {
-        edges.set(k, { seg: [a, b], count: 1 });
-      }
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const neighbor = offsetToAxial(2 * midX - center.x - origin.x, 2 * midY - center.y - origin.y, orientation, dpi);
+      if (hexDistance(neighbor) > n) out.push([a, b]);
     }
-  }
-
-  const out: Segment[] = [];
-  for (const { seg, count } of edges.values()) {
-    if (count === 1) out.push(seg);
   }
   return out;
 }
