@@ -97,6 +97,16 @@ function render() {
   for (const range of ranges) {
     const row = document.createElement("li");
 
+    const visible = document.createElement("input");
+    visible.type = "checkbox";
+    visible.checked = range.visible;
+    visible.title = "Pokazuj ten zasięg";
+    visible.setAttribute("aria-label", `Pokazuj zasięg ${range.name}`);
+    visible.addEventListener("change", () => {
+      range.visible = visible.checked;
+      scheduleSave();
+    });
+
     const color = document.createElement("input");
     color.type = "color";
     color.value = range.color;
@@ -148,7 +158,7 @@ function render() {
       scheduleSave();
     });
 
-    row.append(color, name, cells, remove);
+    row.append(visible, color, name, cells, remove);
     list.append(row);
   }
 }
