@@ -53,7 +53,7 @@ ul {
 
 li {
   display: grid;
-  grid-template-columns: auto 38px 1fr 62px auto;
+  grid-template-columns: 38px minmax(0, 1fr) 62px auto;
   align-items: center;
   gap: 8px;
   padding: 8px;
@@ -144,4 +144,9 @@ button.remove:hover {
 .empty {
   color: var(--muted);
   font-size: 13px;
+}
+
+/* Hide the redundant visibility checkbox without changing the range logic. */
+li > input[type="checkbox"] {
+  display: none;
 }
