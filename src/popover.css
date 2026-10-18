@@ -53,7 +53,7 @@ ul {
 
 li {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) 62px auto;
+  grid-template-columns: auto 38px 1fr 62px auto;
   align-items: center;
   gap: 8px;
   padding: 8px;
@@ -81,6 +81,12 @@ input[type="color"] {
   border-radius: 6px;
   background: var(--field);
   cursor: pointer;
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
 }
 
 input:focus-visible,
